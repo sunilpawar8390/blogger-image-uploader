@@ -3,14 +3,16 @@ const { google } = require('googleapis');
 
 const OAuth2 = google.auth.OAuth2;
 
-// Validate environment variables
-if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET || !process.env.GOOGLE_REFRESH_TOKEN) {
-  console.error('ERROR: Missing required environment variables!');
-  console.error('GOOGLE_CLIENT_ID:', process.env.GOOGLE_CLIENT_ID ? 'Set' : 'MISSING');
-  console.error('GOOGLE_CLIENT_SECRET:', process.env.GOOGLE_CLIENT_SECRET ? 'Set' : 'MISSING');
-  console.error('GOOGLE_REFRESH_TOKEN:', process.env.GOOGLE_REFRESH_TOKEN ? 'Set' : 'MISSING');
-  console.error('Please check your .env file and restart the server.');
-  process.exit(1);
+// Validate environment variables (non-blocking for serverless)
+function validateEnvironmentVariables() {
+  const missing = [];
+  if (!process.env.GOOGLE_CLIENT_ID) missing.push('GOOGLE_CLIENT_ID');
+  if (!process.env.GOOGLE_CLIENT_SECRET) missing.push('GOOGLE_CLIENT_SECRET');
+  if (!process.env.GOOGLE_REFRESH_TOKEN) missing.push('GOOGLE_REFRESH_TOKEN');
+
+  if (missing.length > 0) {
+    throw new Error(`Missing required environment variables: ${missing.join(', ')}`);
+  }
 }
 
 // Set API password (optional - if not set, no authentication required)
@@ -24,32 +26,34 @@ function validatePassword(password) {
   return password === API_PASSWORD;
 }
 
-// Initialize OAuth2 client
-const oauth2Client = new OAuth2(
-  process.env.GOOGLE_CLIENT_ID,
-  process.env.GOOGLE_CLIENT_SECRET,
-  'https://developers.google.com/oauthplayground'
-);
+// Initialize OAuth2 client and Drive API (lazy initialization)
+let oauth2Client = null;
+let drive = null;
 
-// Set credentials
-oauth2Client.setCredentials({
-  refresh_token: process.env.GOOGLE_REFRESH_TOKEN
-});
+function initializeGoogleDrive() {
+  if (!oauth2Client) {
+    // Initialize OAuth2 client
+    oauth2Client = new OAuth2(
+      process.env.GOOGLE_CLIENT_ID,
+      process.env.GOOGLE_CLIENT_SECRET,
+      'https://developers.google.com/oauthplayground'
+    );
 
-// Initialize Google Drive client
-const drive = google.drive({
-  version: 'v3',
-  auth: oauth2Client
-});
+    // Set credentials
+    oauth2Client.setCredentials({
+      refresh_token: process.env.GOOGLE_REFRESH_TOKEN
+    });
 
-// Debug logging
-console.log('✓ Environment Variables Loaded:');
-console.log('  GOOGLE_CLIENT_ID:', process.env.GOOGLE_CLIENT_ID.substring(0, 20) + '...');
-console.log('  GOOGLE_CLIENT_SECRET:', '***' + process.env.GOOGLE_CLIENT_SECRET.slice(-4));
-console.log('  GOOGLE_REFRESH_TOKEN:', '***' + process.env.GOOGLE_REFRESH_TOKEN.slice(-10));
-console.log('  API_PASSWORD:', API_PASSWORD ? 'Set (authentication enabled)' : 'Not set (authentication disabled)');
-console.log('✓ OAuth2 client initialized');
-console.log('✓ Google Drive API ready');
+    // Initialize Google Drive client
+    drive = google.drive({
+      version: 'v3',
+      auth: oauth2Client
+    });
+
+    console.log('✓ Google Drive API initialized');
+  }
+  return drive;
+}
 
 // Helper function to validate URL
 function isValidUrl(string) {
@@ -150,10 +154,11 @@ function getFileExtension(mimeType) {
 // Helper function to find or create "WordPress Thumbnails" folder
 async function getOrCreateFolder(folderName = 'WordPress Thumbnails') {
   try {
+    const driveClient = initializeGoogleDrive();
     console.log(`Looking for folder: ${folderName}`);
 
     // Search for existing folder
-    const response = await drive.files.list({
+    const response = await driveClient.files.list({
       q: `name='${folderName}' and mimeType='application/vnd.google-apps.folder' and trashed=false`,
       fields: 'files(id, name)',
       spaces: 'drive'
@@ -172,7 +177,7 @@ async function getOrCreateFolder(folderName = 'WordPress Thumbnails') {
       mimeType: 'application/vnd.google-apps.folder'
     };
 
-    const folder = await drive.files.create({
+    const folder = await driveClient.files.create({
       requestBody: folderMetadata,
       fields: 'id, name'
     });
@@ -189,6 +194,7 @@ async function getOrCreateFolder(folderName = 'WordPress Thumbnails') {
 // Helper function to upload image to Google Drive and get direct URL
 async function uploadImageToDrive(imageBuffer) {
   try {
+    const driveClient = initializeGoogleDrive();
     const timestamp = Date.now();
     const mimeType = detectImageMimeType(imageBuffer);
     const extension = getFileExtension(mimeType);
@@ -204,7 +210,7 @@ async function uploadImageToDrive(imageBuffer) {
     const stream = Readable.from(imageBuffer);
 
     // Upload to Google Drive in the specified folder
-    const driveResponse = await drive.files.create({
+    const driveResponse = await driveClient.files.create({
       requestBody: {
         name: filename,
         mimeType: mimeType,
@@ -221,7 +227,7 @@ async function uploadImageToDrive(imageBuffer) {
     console.log(`File uploaded to Drive with ID: ${fileId}`);
 
     // Make the file publicly accessible
-    await drive.permissions.create({
+    await driveClient.permissions.create({
       fileId: fileId,
       requestBody: {
         role: 'reader',
@@ -259,10 +265,8 @@ async function uploadImageToDrive(imageBuffer) {
 }
 
 
-// Create HTTP server
-const http = require('http');
-
-const server = http.createServer(async (req, res) => {
+// Vercel serverless function handler
+module.exports = async (req, res) => {
   // Handle CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
@@ -270,130 +274,84 @@ const server = http.createServer(async (req, res) => {
 
   // Handle preflight requests
   if (req.method === 'OPTIONS') {
-    res.writeHead(200);
-    res.end();
-    return;
+    return res.status(200).end();
   }
 
-  // Route handling
-  const parsedUrl = new URL(req.url, `http://${req.headers.host}`);
-
-  if (parsedUrl.pathname === '/api/process' && req.method === 'POST') {
-    // Handle /api/process endpoint
-    let body = '';
-    req.on('data', chunk => {
-      body += chunk.toString();
-    });
-
-    req.on('end', async () => {
-      try {
-        const data = JSON.parse(body);
-
-        // Check authentication
-        if (!validatePassword(data.password)) {
-          res.writeHead(401, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({
-            error: 'Authentication failed',
-            message: 'Invalid or missing password'
-          }));
-          return;
-        }
-
-        // Validate input
-        if (!data.postUrl) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Post URL is required' }));
-          return;
-        }
-
-        if (!isValidUrl(data.postUrl)) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Invalid URL format' }));
-          return;
-        }
-
-        // Fetch WordPress post HTML
-        let html;
-        try {
-          const response = await axios.get(data.postUrl, {
-            timeout: 10000,
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (compatible; BloggerImageUploader/1.0)'
-            }
-          });
-          html = response.data;
-        } catch (error) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Failed to fetch WordPress post' }));
-          return;
-        }
-
-        // Extract image URLs
-        const baseUrl = new URL(data.postUrl).origin;
-        const imageUrls = extractImageUrls(html, baseUrl);
-
-        if (imageUrls.length === 0) {
-          res.writeHead(404, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'No images found in the post' }));
-          return;
-        }
-
-        // Use the first available image URL
-        const imageUrl = imageUrls[0];
-
-        // Download image
-        const imageBuffer = await downloadImage(imageUrl);
-
-        // Upload to Google Drive only
-        console.log('Uploading image to Google Drive...');
-        const driveResult = await uploadImageToDrive(imageBuffer);
-        console.log('Upload complete!');
-
-        // Return response with direct image URL from Drive
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          success: true,
-          imageUrl: driveResult.directImageUrl, // Best URL for embedding/previews
-          filename: driveResult.filename,
-          fileId: driveResult.fileId,
-          alternativeUrls: driveResult.alternativeUrls, // Additional URL formats
-          driveViewLink: driveResult.webViewLink,
-          originalImage: imageUrl,
-          message: 'Image uploaded to Google Drive successfully.'
-        }));
-
-      } catch (error) {
-        console.error('API Error:', error);
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: error.message }));
-      }
-    });
-    return;
-
-  } else if (parsedUrl.pathname === '/' && req.method === 'GET') {
-    // Simple root endpoint for testing
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      message: 'Google Drive Image Uploader API',
-      description: 'Upload WordPress post images to Google Drive',
-      endpoints: {
-        'POST /api/process': 'Process WordPress post URL and upload image to Drive'
-      }
-    }));
-    return;
-
-  } else {
-    // 404 for other routes
-    res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Not found' }));
-    return;
+  // Only allow POST requests
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
   }
-});
 
-// Start server
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-  console.log(`GET  http://localhost:${PORT}/`);
-  console.log(`POST http://localhost:${PORT}/api/process`);
-});
+  try {
+    // Validate environment variables
+    validateEnvironmentVariables();
+
+    const data = req.body;
+
+    // Check authentication
+    if (!validatePassword(data.password)) {
+      return res.status(401).json({
+        error: 'Authentication failed',
+        message: 'Invalid or missing password'
+      });
+    }
+
+    // Validate input
+    if (!data.postUrl) {
+      return res.status(400).json({ error: 'Post URL is required' });
+    }
+
+    if (!isValidUrl(data.postUrl)) {
+      return res.status(400).json({ error: 'Invalid URL format' });
+    }
+
+    // Fetch WordPress post HTML
+    let html;
+    try {
+      const response = await axios.get(data.postUrl, {
+        timeout: 10000,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (compatible; BloggerImageUploader/1.0)'
+        }
+      });
+      html = response.data;
+    } catch (error) {
+      return res.status(400).json({ error: 'Failed to fetch WordPress post' });
+    }
+
+    // Extract image URLs
+    const baseUrl = new URL(data.postUrl).origin;
+    const imageUrls = extractImageUrls(html, baseUrl);
+
+    if (imageUrls.length === 0) {
+      return res.status(404).json({ error: 'No images found in the post' });
+    }
+
+    // Use the first available image URL
+    const imageUrl = imageUrls[0];
+
+    // Download image
+    const imageBuffer = await downloadImage(imageUrl);
+
+    // Upload to Google Drive only
+    console.log('Uploading image to Google Drive...');
+    const driveResult = await uploadImageToDrive(imageBuffer);
+    console.log('Upload complete!');
+
+    // Return response with direct image URL from Drive
+    return res.status(200).json({
+      success: true,
+      imageUrl: driveResult.directImageUrl, // Best URL for embedding/previews
+      filename: driveResult.filename,
+      fileId: driveResult.fileId,
+      alternativeUrls: driveResult.alternativeUrls, // Additional URL formats
+      driveViewLink: driveResult.webViewLink,
+      originalImage: imageUrl,
+      message: 'Image uploaded to Google Drive successfully.'
+    });
+
+  } catch (error) {
+    console.error('API Error:', error);
+    return res.status(500).json({ error: error.message });
+  }
+};
