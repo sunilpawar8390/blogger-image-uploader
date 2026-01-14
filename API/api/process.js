@@ -3,6 +3,27 @@ const { google } = require('googleapis');
 
 const OAuth2 = google.auth.OAuth2;
 
+// Validate environment variables
+if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET || !process.env.GOOGLE_REFRESH_TOKEN) {
+  console.error('ERROR: Missing required environment variables!');
+  console.error('GOOGLE_CLIENT_ID:', process.env.GOOGLE_CLIENT_ID ? 'Set' : 'MISSING');
+  console.error('GOOGLE_CLIENT_SECRET:', process.env.GOOGLE_CLIENT_SECRET ? 'Set' : 'MISSING');
+  console.error('GOOGLE_REFRESH_TOKEN:', process.env.GOOGLE_REFRESH_TOKEN ? 'Set' : 'MISSING');
+  console.error('Please check your .env file and restart the server.');
+  process.exit(1);
+}
+
+// Set API password (optional - if not set, no authentication required)
+const API_PASSWORD = process.env.API_PASSWORD || null;
+
+// Helper function to validate API password
+function validatePassword(password) {
+  if (!API_PASSWORD) {
+    return true; // No password required
+  }
+  return password === API_PASSWORD;
+}
+
 // Initialize OAuth2 client
 const oauth2Client = new OAuth2(
   process.env.GOOGLE_CLIENT_ID,
@@ -10,21 +31,25 @@ const oauth2Client = new OAuth2(
   'https://developers.google.com/oauthplayground'
 );
 
+// Set credentials
 oauth2Client.setCredentials({
   refresh_token: process.env.GOOGLE_REFRESH_TOKEN
 });
 
-const blogger = google.blogger({
+// Initialize Google Drive client
+const drive = google.drive({
   version: 'v3',
   auth: oauth2Client
 });
 
 // Debug logging
-console.log('Environment Variables Check:');
-console.log('GOOGLE_CLIENT_ID:', process.env.GOOGLE_CLIENT_ID ? 'Set' : 'Missing');
-console.log('GOOGLE_CLIENT_SECRET:', process.env.GOOGLE_CLIENT_SECRET ? 'Set' : 'Missing');
-console.log('GOOGLE_REFRESH_TOKEN:', process.env.GOOGLE_REFRESH_TOKEN ? 'Set' : 'Missing');
-console.log('BLOGGER_BLOG_ID:', process.env.BLOGGER_BLOG_ID ? process.env.BLOGGER_BLOG_ID : 'Missing');
+console.log('✓ Environment Variables Loaded:');
+console.log('  GOOGLE_CLIENT_ID:', process.env.GOOGLE_CLIENT_ID.substring(0, 20) + '...');
+console.log('  GOOGLE_CLIENT_SECRET:', '***' + process.env.GOOGLE_CLIENT_SECRET.slice(-4));
+console.log('  GOOGLE_REFRESH_TOKEN:', '***' + process.env.GOOGLE_REFRESH_TOKEN.slice(-10));
+console.log('  API_PASSWORD:', API_PASSWORD ? 'Set (authentication enabled)' : 'Not set (authentication disabled)');
+console.log('✓ OAuth2 client initialized');
+console.log('✓ Google Drive API ready');
 
 // Helper function to validate URL
 function isValidUrl(string) {
@@ -96,86 +121,143 @@ async function downloadImage(imageUrl) {
   }
 }
 
-// Helper function to upload image to Google Drive and get CDN URL
+// Helper function to detect image MIME type from buffer
+function detectImageMimeType(imageBuffer) {
+  // Check magic numbers to detect image type
+  if (imageBuffer[0] === 0xFF && imageBuffer[1] === 0xD8 && imageBuffer[2] === 0xFF) {
+    return 'image/jpeg';
+  } else if (imageBuffer[0] === 0x89 && imageBuffer[1] === 0x50 && imageBuffer[2] === 0x4E && imageBuffer[3] === 0x47) {
+    return 'image/png';
+  } else if (imageBuffer[0] === 0x47 && imageBuffer[1] === 0x49 && imageBuffer[2] === 0x46) {
+    return 'image/gif';
+  } else if (imageBuffer[0] === 0x52 && imageBuffer[1] === 0x49 && imageBuffer[2] === 0x46 && imageBuffer[3] === 0x46) {
+    return 'image/webp';
+  }
+  return 'image/jpeg'; // Default fallback
+}
+
+// Helper function to get file extension from MIME type
+function getFileExtension(mimeType) {
+  const extensions = {
+    'image/jpeg': 'jpg',
+    'image/png': 'png',
+    'image/gif': 'gif',
+    'image/webp': 'webp'
+  };
+  return extensions[mimeType] || 'jpg';
+}
+
+// Helper function to find or create "WordPress Thumbnails" folder
+async function getOrCreateFolder(folderName = 'WordPress Thumbnails') {
+  try {
+    console.log(`Looking for folder: ${folderName}`);
+
+    // Search for existing folder
+    const response = await drive.files.list({
+      q: `name='${folderName}' and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+      fields: 'files(id, name)',
+      spaces: 'drive'
+    });
+
+    if (response.data.files && response.data.files.length > 0) {
+      const folderId = response.data.files[0].id;
+      console.log(`Found existing folder with ID: ${folderId}`);
+      return folderId;
+    }
+
+    // Create folder if it doesn't exist
+    console.log(`Folder not found. Creating new folder: ${folderName}`);
+    const folderMetadata = {
+      name: folderName,
+      mimeType: 'application/vnd.google-apps.folder'
+    };
+
+    const folder = await drive.files.create({
+      requestBody: folderMetadata,
+      fields: 'id, name'
+    });
+
+    console.log(`Created folder with ID: ${folder.data.id}`);
+    return folder.data.id;
+
+  } catch (error) {
+    console.error('Error getting/creating folder:', error);
+    throw new Error(`Failed to get/create folder: ${error.message}`);
+  }
+}
+
+// Helper function to upload image to Google Drive and get direct URL
 async function uploadImageToDrive(imageBuffer) {
   try {
     const timestamp = Date.now();
-    const filename = `push-image-${timestamp}.jpg`;
+    const mimeType = detectImageMimeType(imageBuffer);
+    const extension = getFileExtension(mimeType);
+    const filename = `push-image-${timestamp}.${extension}`;
 
-    const media = {
-      mimeType: 'image/jpeg',
-      body: imageBuffer
-    };
+    console.log(`Uploading image to Google Drive: ${filename}`);
 
-    // Upload to Google Drive
+    // Get or create "WordPress Thumbnails" folder
+    const folderId = await getOrCreateFolder('WordPress Thumbnails');
+
+    // Convert buffer to stream
+    const { Readable } = require('stream');
+    const stream = Readable.from(imageBuffer);
+
+    // Upload to Google Drive in the specified folder
     const driveResponse = await drive.files.create({
-      resource: {
+      requestBody: {
         name: filename,
-        parents: ['root'], // Upload to root folder
-        mimeType: 'image/jpeg'
+        mimeType: mimeType,
+        parents: [folderId] // Upload to "WordPress Thumbnails" folder
       },
-      media: media,
-      fields: 'id, webViewLink, webContentLink, webViewLink'
+      media: {
+        mimeType: mimeType,
+        body: stream
+      },
+      fields: 'id, name, mimeType, webViewLink, webContentLink'
     });
 
+    const fileId = driveResponse.data.id;
+    console.log(`File uploaded to Drive with ID: ${fileId}`);
+
+    // Make the file publicly accessible
+    await drive.permissions.create({
+      fileId: fileId,
+      requestBody: {
+        role: 'reader',
+        type: 'anyone'
+      }
+    });
+
+    console.log('File permissions set to public');
+
+    // Get multiple URL formats for compatibility
+    // Format 1: Best for embedding in images/notifications (GoogleUserContent)
+    const googleusercontent = `https://lh3.googleusercontent.com/d/${fileId}`;
+
+    // Format 2: Alternative download format
+    const driveDownload = `https://drive.google.com/uc?id=${fileId}`;
+
+    // Format 3: Thumbnail format (if needed)
+    const driveThumbnail = `https://drive.google.com/thumbnail?id=${fileId}&sz=w1000`;
+
     return {
-      fileId: driveResponse.data.id,
-      webViewLink: driveResponse.data.webViewLink,
-      webContentLink: driveResponse.data.webContentLink
+      fileId: fileId,
+      filename: filename,
+      directImageUrl: googleusercontent, // Best for embedding/previews
+      alternativeUrls: {
+        driveDownload: driveDownload,
+        driveThumbnail: driveThumbnail
+      },
+      webViewLink: driveResponse.data.webViewLink
     };
+
   } catch (error) {
+    console.error('Drive upload error:', error);
     throw new Error(`Failed to upload to Google Drive: ${error.message}`);
   }
 }
 
-// Helper function to upload image to Blogger
-async function uploadImageToBlogger(imageBuffer) {
-  try {
-    const timestamp = Date.now();
-
-    // First upload to Google Drive
-    const driveResult = await uploadImageToDrive(imageBuffer);
-
-    // Create Blogger post with Drive image
-    const postContent = `
-<div style="text-align: center; margin: 20px 0;">
-  <img src="${driveResult.webViewLink}"
-       alt="Push notification image"
-       style="max-width: 100%; height: auto;" />
-</div>
-
-<div style="font-size: 12px; color: #666; margin-top: 20px; text-align: center;">
-  <p>📱 Generated for push notification - ${new Date().toLocaleString()}</p>
-  <p>🔗 Original: [View in Drive](${driveResult.webViewLink})</p>
-</div>
-    `;
-
-    const post = {
-      title: `Push Image ${timestamp}`,
-      content: postContent,
-      labels: ['push-image', 'drive-upload', 'temp'],
-      status: 'draft'
-    };
-
-    // Create the post
-    const response = await blogger.posts.insert({
-      blogId: process.env.BLOGGER_BLOG_ID,
-      resource: post
-    });
-
-    // Extract the image URL from Blogger's response
-    const postContentHtml = response.data.content;
-    const imageUrlMatch = postContentHtml.match(/src="([^"]+)"/);
-
-    if (imageUrlMatch && imageUrlMatch[1]) {
-      return imageUrlMatch[1]; // Return the actual Blogger CDN URL
-    }
-
-    throw new Error('Could not extract image URL from Blogger response');
-  } catch (error) {
-    throw new Error(`Failed to upload image to Blogger: ${error.message}`);
-  }
-}
 
 // Create HTTP server
 const http = require('http');
@@ -206,6 +288,16 @@ const server = http.createServer(async (req, res) => {
     req.on('end', async () => {
       try {
         const data = JSON.parse(body);
+
+        // Check authentication
+        if (!validatePassword(data.password)) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            error: 'Authentication failed',
+            message: 'Invalid or missing password'
+          }));
+          return;
+        }
 
         // Validate input
         if (!data.postUrl) {
@@ -252,15 +344,22 @@ const server = http.createServer(async (req, res) => {
         // Download image
         const imageBuffer = await downloadImage(imageUrl);
 
-        // Upload to Blogger
-        const bloggerImageUrl = await uploadImageToBlogger(imageBuffer);
+        // Upload to Google Drive only
+        console.log('Uploading image to Google Drive...');
+        const driveResult = await uploadImageToDrive(imageBuffer);
+        console.log('Upload complete!');
 
-        // Return response
+        // Return response with direct image URL from Drive
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
-          imageUrl: bloggerImageUrl,
+          success: true,
+          imageUrl: driveResult.directImageUrl, // Best URL for embedding/previews
+          filename: driveResult.filename,
+          fileId: driveResult.fileId,
+          alternativeUrls: driveResult.alternativeUrls, // Additional URL formats
+          driveViewLink: driveResult.webViewLink,
           originalImage: imageUrl,
-          blogId: process.env.BLOGGER_BLOG_ID
+          message: 'Image uploaded to Google Drive successfully.'
         }));
 
       } catch (error) {
@@ -275,9 +374,10 @@ const server = http.createServer(async (req, res) => {
     // Simple root endpoint for testing
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
-      message: 'Blogger Image Uploader API',
+      message: 'Google Drive Image Uploader API',
+      description: 'Upload WordPress post images to Google Drive',
       endpoints: {
-        'POST /api/process': 'Process WordPress post URL'
+        'POST /api/process': 'Process WordPress post URL and upload image to Drive'
       }
     }));
     return;
