@@ -1,21 +1,17 @@
 {
   "name": "blogger-image-uploader-api",
   "version": "1.0.0",
-  "description": "Serverless API to upload WordPress post images to Google Blogger",
+  "description": "Serverless API to upload WordPress post images to Google Drive",
   "main": "index.js",
+  "type": "commonjs",
   "scripts": {
     "dev": "vercel dev"
   },
   "dependencies": {
     "axios": "^1.6.0",
-    "dotenv": "^17.2.3",
-    "googleapis": "^128.0.0",
-    "sharp": "^0.33.0"
-  },
-  "devDependencies": {
-    "vercel": "^50.3.2"
+    "googleapis": "^128.0.0"
   },
   "engines": {
-    "node": "24.x"
+    "node": "20.x"
   }
 }
